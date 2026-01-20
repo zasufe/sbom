@@ -137,13 +137,13 @@ async def create_sbom_project(
 @router.get("/sbom/get_language_down")
 async def get_language_down():
     ret_data = [
-        {"label": "python", "value": "python"},
-        {"label": "golang", "value": "golang"},
-        {"label": "php", "value": "php"},
-        {"label": "javascript", "value": "javascript"},
-        {"label": "rust", "value": "rust"},
-        {"label": "java", "value": "java"},
-        {"label": "c/c++", "value": "c/c++"},
+        {"label": "Python", "value": "python"},
+        {"label": "Go", "value": "golang"},
+        {"label": "PHP", "value": "php"},
+        {"label": "Javascript", "value": "javascript"},
+        {"label": "RUST", "value": "rust"},
+        {"label": "Java", "value": "java"},
+        {"label": "C/C++", "value": "c/c++"},
     ]
     return BaseResponseModel.success("获取语言下拉成功", data=ret_data).resp()
 

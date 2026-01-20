@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse, Response
 
 
-def mk_resp(message: str = 'success', data: Any = None, code: int = 0) -> Response:
+def mk_resp(message: str = 'success', data: Any = None, error_code: int = 0) -> Response:
     """Generate a JSON response compatible with the existing protocol.
 
     Protocol:
@@ -23,7 +23,7 @@ def mk_resp(message: str = 'success', data: Any = None, code: int = 0) -> Respon
 
     We keep HTTP status_code=200 to match the Flask behavior.
     """
-    result = {'error_code': code, 'message': message}
+    result = {'error_code': error_code, 'message': message}
     if data is not None:
         result.update({'data': data})
     return JSONResponse(status_code=200, content=result)
@@ -67,17 +67,17 @@ DataT = TypeVar('DataT')
 
 class BaseResponseModel(BaseModel, Generic[DataT]):
     """基本响应模型"""
-    code: int = Field(title='状态码', description='0为成功，其他为失败')
+    error_code: int = Field(title='状态码', description='0为成功，其他为失败')
     message: str = Field(title='消息', description='成功或失败的消息')
     data: DataT = Field(title='数据')
 
     @classmethod
     def success(cls, message: str = '成功', data: DataT = None) -> 'BaseResponseModel[DataT]':
-        return cls(code=0, message=message, data=data)
+        return cls(error_code=0, message=message, data=data)
 
     @classmethod
-    def failed(cls, message: str = '失败', data: DataT = None, code: int = -1) -> 'BaseResponseModel[DataT]':
-        return cls(code=code, message=message, data=data)
+    def failed(cls, message: str = '失败', data: DataT = None, error_code: int = -1) -> 'BaseResponseModel[DataT]':
+        return cls(error_code=error_code, message=message, data=data)
 
     def resp(self) -> Response:
         return JSONResponse(status_code=200, content=self.model_dump(mode='json'))
@@ -89,7 +89,7 @@ class BaseResponseModel(BaseModel, Generic[DataT]):
 
 class BaseResponseWithPaginationModel(BaseModel, Generic[DataT]):
     """分页响应模型"""
-    code: int = Field(title='状态码', description='0为成功，其他为失败')
+    error_code: int = Field(title='状态码', description='0为成功，其他为失败')
     message: str = Field(title='消息', description='成功或失败的消息')
     data: list[DataT] = Field(title='数据')
     pagination: PaginationRes = Field(title='分页信息')
@@ -98,17 +98,17 @@ class BaseResponseWithPaginationModel(BaseModel, Generic[DataT]):
     def success(
         cls, message: str = '成功', data: list[DataT] = None, pagination: PaginationRes = None
     ) -> 'BaseResponseWithPaginationModel':
-        return cls(code=0, message=message, data=data, pagination=pagination)
+                return cls(error_code=0, message=message, data=data, pagination=pagination)
 
     @classmethod
     def failed(
-        cls, message: str = '失败', data: list[DataT] = None, pagination: PaginationRes = None, code: int = -1
+        cls, message: str = '失败', data: list[DataT] = None, pagination: PaginationRes = None, error_code: int = -1
     ) -> 'BaseResponseWithPaginationModel':
         if data is None:
             data = []
         if pagination is None:
             pagination = PaginationRes(page=1, page_size=10, total=0, total_page=0)
-        return cls(code=code, message=message, data=data, pagination=pagination)
+        return cls(error_code=error_code, message=message, data=data, pagination=pagination)
 
     def resp(self) -> Response:
         return JSONResponse(status_code=200, content=self.model_dump(mode='json'))
@@ -120,16 +120,16 @@ class BaseResponseWithPaginationModel(BaseModel, Generic[DataT]):
 
 class BaseResponseNoDataModel(BaseModel):
     """无数据响应模型"""
-    code: int = Field(title='状态码', description='0为成功，其他为失败')
+    error_code: int = Field(title='状态码', description='0为成功，其他为失败')
     message: str = Field(title='消息', description='成功或失败的消息')
 
     @classmethod
     def success(cls, message: str = '成功') -> 'BaseResponseNoDataModel':
-        return cls(code=0, message=message)
+        return cls(error_code=0, message=message)
 
     @classmethod
-    def failed(cls, message: str = '失败', code: int = -1) -> 'BaseResponseNoDataModel':
-        return cls(code=code, message=message)
+    def failed(cls, message: str = '失败', error_code: int = -1) -> 'BaseResponseNoDataModel':
+        return cls(error_code=error_code, message=message)
 
     def resp(self) -> Response:
         return JSONResponse(status_code=200, content=self.model_dump(mode='json'))
@@ -165,8 +165,8 @@ class BarChat(BaseModel):
 class BusinessException(Exception):
     """业务层异常"""
 
-    def __init__(self, message: str, code: int = -1, data=None):
-        self.code = code
+    def __init__(self, message: str, error_code: int = -1, data=None):
+        self.error_code = error_code
         self.message = message
         self.data = data
         self.tb: list[traceback.FrameSummary] = traceback.extract_stack()[:-1]
@@ -181,13 +181,13 @@ class BusinessException(Exception):
         return f'<HttpError code={self.code} message="{self.message}" data={repr(self.data)} file="{lt.filename}" line={lt.lineno} {lt.name}>'
 
     def resp(self) -> Response:
-        return mk_resp(message=self.message, code=self.code, data=self.data)
+        return mk_resp(message=self.message, error_code=self.error_code, data=self.data)
 
     @classmethod
     def not_login(cls) -> "BusinessException":
         traceback.print_exc()
-        return cls('未登录', code=2000)
+        return cls('未登录', error_code=2000)
 
     @classmethod
     def no_permission(cls) -> "BusinessException":
-        return cls('无权限', code=2001)
+        return cls('无权限', error_code=2001)
