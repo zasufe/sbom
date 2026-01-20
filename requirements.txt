@@ -1,0 +1,16 @@
+fastapi[standard]
+uvicorn[standard]
+pydantic
+pydantic_settings
+sqlalchemy
+sqlalchemy[asyncio]
+alembic
+PyMySQL
+asyncmy
+requests
+requests-toolbelt
+python-multipart
+jsonref
+aiofiles
+httpx
+greenlet==2.0.1
