@@ -10,6 +10,10 @@ from src.config import get_settings
 from src.service.utils import BusinessException
 
 
+# =========================
+# 基础工具
+# =========================
+
 def _base_url() -> str:
     # 统一处理末尾 /
     host = get_settings().dx.api_host.rstrip("/")
@@ -20,7 +24,6 @@ def _headers_json() -> dict[str, str]:
     s = get_settings().dx
     if not s.api_key:
         raise BusinessException("DX_API_KEY 未配置")
-    # Dependency-Track header 通常是 X-Api-Key（大小写不敏感，但建议规范）
     return {
         "X-Api-Key": s.api_key,
         "Accept": "application/json",
@@ -40,10 +43,27 @@ def _headers_any(content_type: str) -> dict[str, str]:
 
 
 async def _client() -> httpx.AsyncClient:
-    # 每次创建 client 成本不大，但生产更推荐用单例 client（可在 lifespan 中实现）。
-    # 这里先保持最小改动、可运行。
-    return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+    # 保持最小改动：每次创建 client；如果要更高性能，建议在 FastAPI lifespan 中维护单例 client。
+    # timeout 生产建议分 connect/read/write/pool；这里先给稳妥值。
+    timeout = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
+    return httpx.AsyncClient(timeout=timeout)
 
+
+async def _sleep_1s() -> None:
+    import asyncio
+    await asyncio.sleep(1)
+
+
+def _err_of(resp: httpx.Response) -> str:
+    # 统一把错误内容截断，避免日志/DB 爆炸
+    text = resp.text or ""
+    text = text[:2000]
+    return f"{resp.status_code}: {text}"
+
+
+# =========================
+# API 封装
+# =========================
 
 async def get_bom_result(project_uuid: str, page_size: int = 10, page_number: int = 1, search_text: str = "") -> Any:
     url = f"{_base_url()}/api/v1/component/project/{project_uuid}"
@@ -69,24 +89,47 @@ async def create_project(project_name: str) -> str:
         "version": "1.0",
     }
 
-    # 轻量重试（网络抖动）
     last_err: str | None = None
     for _ in range(3):
         async with (await _client()) as c:
             r = await c.put(url, headers=_headers_json(), content=json.dumps(payload))
         if r.status_code == 201:
-            return r.json().get("uuid")
-        last_err = f"{r.status_code}: {r.text}"
+            uuid = r.json().get("uuid")
+            if not uuid:
+                raise BusinessException("DX 返回 201 但 uuid 为空")
+            return uuid
+        last_err = _err_of(r)
         await _sleep_1s()
 
-    raise BusinessException(f"NETWORK_ERROR: {last_err or 'unknown'}")
+    raise BusinessException(f"DX_CREATE_PROJECT_FAILED: {last_err or 'unknown'}")
 
 
 async def delete_project(project_uuid: str) -> bool:
+    """
+    删除 Dependency-Track 项目
+
+    你抓包里是：
+      DELETE /api/v1/project/{uuid}
+
+    生产兼容：
+      - 204 No Content：常见成功
+      - 200 OK / 202 Accepted：有些版本/反向代理会返回
+      - 404 Not Found：项目已不存在，也视为成功（幂等）
+    """
     url = f"{_base_url()}/api/v1/project/{project_uuid}"
-    async with (await _client()) as c:
-        r = await c.delete(url, headers=_headers_json())
-    return r.status_code == 204
+
+    last_err: str | None = None
+    for _ in range(3):
+        async with (await _client()) as c:
+            r = await c.delete(url, headers=_headers_json())
+
+        if r.status_code in (200, 202, 204, 404):
+            return True
+
+        last_err = _err_of(r)
+        await _sleep_1s()
+
+    raise BusinessException(f"DX_DELETE_PROJECT_FAILED: {last_err or 'unknown'}")
 
 
 async def update_project_bom(project_uuid: str, file_path: str) -> bool:
@@ -98,19 +141,21 @@ async def update_project_bom(project_uuid: str, file_path: str) -> bool:
     """
     url = f"{_base_url()}/api/v1/bom"
 
-    # 用 httpx files= 直接 multipart（无需 requests_toolbelt）
     try:
         with open(file_path, "rb") as f:
             files = {
                 "project": (None, project_uuid),
                 "bom": (f"{project_uuid}.json", f, "application/json"),
             }
+            # multipart 时不要强塞 Content-Type: application/json
+            headers = {"X-Api-Key": get_settings().dx.api_key, "Accept": "application/json"}
             async with (await _client()) as c:
-                r = await c.post(url, headers={"X-Api-Key": get_settings().dx.api_key, "Accept": "application/json"}, files=files)
+                r = await c.post(url, headers=headers, files=files)
     except FileNotFoundError:
         return False
 
-    return r.status_code == 200
+    # 200 OK：常见成功；有些版本可能 201
+    return r.status_code in (200, 201)
 
 
 async def get_count(project_uuid: str) -> Any:
@@ -161,8 +206,3 @@ async def get_vulnerabilities_details(vuln_id: str) -> Any:
     if r.status_code == 200:
         return r.json()
     return None
-
-
-async def _sleep_1s() -> None:
-    import asyncio
-    await asyncio.sleep(1)

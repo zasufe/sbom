@@ -5,7 +5,7 @@ import datetime
 import os
 import shutil
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.sbom_models import SbomProject
@@ -20,6 +20,9 @@ from src.service.sbom.sbom_args import (
     ProjectInfo,
 )
 from src.service.utils import BusinessException
+
+# ✅ 新增：引入 dx_ctl，用于同步删除 Dependency-Track 项目
+from src.service.sbom import dx_ctl
 
 
 async def create_sbom_project(
@@ -112,7 +115,6 @@ async def select_project(session: AsyncSession, args: SelectSbomProjectArgs, use
         "create_time": lambda x: x.strftime("%Y-%m-%d %H:%M") if x else "",
         "update_time": lambda x: x.strftime("%Y-%m-%d %H:%M") if x else "",
     }
-    # 注意：这里需要 sbom_args.SelectSbomProjectReturn.build_res_with_sql_query 也改成 async
     return await SelectSbomProjectReturn.build_res_with_sql_query(
         pagination_req=args,
         query=query,
@@ -122,17 +124,35 @@ async def select_project(session: AsyncSession, args: SelectSbomProjectArgs, use
 
 
 async def delete_project(session: AsyncSession, args: DeleteSbomProjectArgs, user_id: int) -> bool:
+    """
+    删除项目（同步删除 Dependency-Track + 删除本地目录 + 删除DB）
+
+    强一致策略（默认）：
+      - DX 删除失败 => 直接抛异常（不删除DB），避免“DB删了但DX还在”。
+    """
     await project_authentication(session, args.project_id, user_id)
 
-    stmt_path = select(SbomProject.code_path).where(SbomProject.id == args.project_id)
-    row = (await session.execute(stmt_path)).first()
-    code_path = row.code_path if row else None
+    # 1) 取出 code_path + dx_uuid
+    stmt = select(SbomProject.code_path, SbomProject.dx_uuid).where(SbomProject.id == args.project_id)
+    row = (await session.execute(stmt)).first()
+    if not row:
+        raise BusinessException("未知项目")
 
+    code_path = row.code_path
+    dx_uuid = row.dx_uuid
+
+    # 2) ✅ 同步删除 Dependency-Track 项目
+    #    兼容 204/200/202/404，失败会抛 BusinessException（见 dx_ctl.delete_project）
+    if dx_uuid:
+        await dx_ctl.delete_project(dx_uuid)
+
+    # 3) 删除本地目录（失败不阻断）
     if code_path and os.path.exists(code_path):
-        shutil.rmtree(code_path)
+        shutil.rmtree(code_path, ignore_errors=True)
 
-    stmt = delete(SbomProject).where(SbomProject.id == args.project_id)
-    await session.execute(stmt)
+    # 4) 删除 DB
+    stmt_del = delete(SbomProject).where(SbomProject.id == args.project_id)
+    await session.execute(stmt_del)
     await session.commit()
     return True
 

@@ -1,188 +1,215 @@
+# main.py
 from __future__ import annotations
 
 import logging
-import sys
-from pathlib import Path
-from typing import Any
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Final
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-from loguru import logger
+from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.api.sbom import router as sbom_router
 from src.service.utils import BusinessException
 
+# =========================
+# 基础配置（可用环境变量覆盖）
+# =========================
+
+APP_NAME: Final[str] = os.getenv("APP_NAME", "SBOM Service")
+APP_VERSION: Final[str] = os.getenv("APP_VERSION", "1.0.0")
+ENV: Final[str] = os.getenv("ENV", "prod")  # dev / prod
+LOG_LEVEL: Final[str] = os.getenv("LOG_LEVEL", "INFO").upper()
+
 
 # =========================
-# 日志配置（生产级）
+# logging 初始化（标准库，生产稳定）
 # =========================
-
-LOG_LEVEL = "INFO"
-LOG_DIR = Path("logs")
-LOG_DIR.mkdir(exist_ok=True)
-
-LOG_FILE = LOG_DIR / "sbom-service.log"
-
 
 def setup_logging() -> None:
     """
-    统一日志初始化。
-    - 使用 loguru 作为核心日志引擎
-    - 接管标准 logging（uvicorn / fastapi 内部日志）
-    - 输出：控制台 + 文件（可轮转）
-    - 结构化字段：timestamp / level / module / function / line
+    生产级 logging 初始化：
+    - stdout 输出（容器/系统采集友好）
+    - 不混用 loguru，避免 uvicorn/fastapi 接管冲突
     """
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(LOG_LEVEL)
 
-    # 移除 loguru 默认 handler
-    logger.remove()
-
-    # 控制台输出（开发 / 容器 stdout）
-    logger.add(
-        sys.stdout,
-        level=LOG_LEVEL,
-        format=(
-            "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-            "<level>{level: <8}</level> | "
-            "{name}:{function}:{line} - {message}"
-        ),
-        enqueue=True,
-        backtrace=False,
-        diagnose=False,
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        fmt="%(asctime)s.%(msecs)03d | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+    handler.setFormatter(formatter)
+    root.addHandler(handler)
 
-    # 文件输出（生产持久化）
-    logger.add(
-        LOG_FILE,
-        level=LOG_LEVEL,
-        rotation="10 MB",          # 单文件 10MB 自动切分
-        retention="7 days",        # 保留 7 天
-        compression="zip",         # 压缩历史日志
-        enqueue=True,
-        backtrace=False,
-        diagnose=False,
-        format=(
-            "{time:YYYY-MM-DD HH:mm:ss.SSS} | "
-            "{level: <8} | "
-            "{name}:{function}:{line} | "
-            "{message}"
-        ),
-    )
-
-    # 接管标准 logging（让 uvicorn / fastapi 的日志也走 loguru）
-    class InterceptHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            try:
-                level = logger.level(record.levelname).name
-            except ValueError:
-                level = record.levelno
-
-            frame, depth = logging.currentframe(), 2
-            while frame and frame.f_code.co_filename == logging.__file__:
-                frame = frame.f_back
-                depth += 1
-
-            logger.opt(depth=depth, exception=record.exc_info).log(
-                level, record.getMessage()
-            )
-
-    logging.basicConfig(handlers=[InterceptHandler()], level=LOG_LEVEL, force=True)
-
-    # 明确 uvicorn / fastapi 日志级别
-    for _logger in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
-        logging.getLogger(_logger).handlers = [InterceptHandler()]
-        logging.getLogger(_logger).setLevel(LOG_LEVEL)
+    # 降低 uvicorn.access 噪声时可启用（需要时再打开）
+    # logging.getLogger("uvicorn.access").setLevel(logging.INFO)
 
 
 # =========================
-# FastAPI 应用工厂
+# 中间件：Request-ID + 请求日志
+# =========================
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    """
+    为每个请求生成 request_id，并记录：
+    - 方法/路径/状态码/耗时
+    - 异常时记录堆栈
+    """
+    def __init__(self, app: FastAPI):
+        super().__init__(app)
+        self.log = logging.getLogger("app.request")
+
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex
+        request.state.request_id = rid
+
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = int((time.perf_counter() - start) * 1000)
+            self.log.exception(
+                "request_error request_id=%s method=%s path=%s duration_ms=%s",
+                rid, request.method, request.url.path, duration_ms,
+            )
+            raise
+
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        self.log.info(
+            "request_done request_id=%s method=%s path=%s status=%s duration_ms=%s",
+            rid, request.method, request.url.path, response.status_code, duration_ms,
+        )
+
+        # 回写 request-id，便于前端/调用方关联日志
+        response.headers["X-Request-ID"] = rid
+        return response
+
+
+# =========================
+# Lifespan（替代 on_event）
+# =========================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log = logging.getLogger("app.lifespan")
+
+    # ✅ 启动阶段（初始化资源、预热、检查依赖）
+    log.info("startup env=%s version=%s", ENV, APP_VERSION)
+
+    # 例：你可以在这里做 DB 连接探测 / DX 服务探测
+    # await check_db()
+    # await check_dx()
+
+    yield
+
+    # ✅ 关闭阶段（释放资源）
+    log.info("shutdown complete")
+
+
+# =========================
+# App 工厂
 # =========================
 
 def create_app() -> FastAPI:
-    """
-    FastAPI 应用工厂（官方推荐模式）
-    """
     setup_logging()
+    log = logging.getLogger("app")
+
+    # FastAPI 初始化：生产建议关闭 docs（可按需开启）
+    docs_url = "/docs" if ENV != "prod" else None
+    redoc_url = "/redoc" if ENV != "prod" else None
+    openapi_url = "/openapi.json" if ENV != "prod" else None
 
     app = FastAPI(
-        title="SBOM Service",
-        version="1.0.0",
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
+        title=APP_NAME,
+        version=APP_VERSION,
+        lifespan=lifespan,
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        openapi_url=openapi_url,
     )
 
-    # 路由注册
+    # 中间件：请求日志 + request_id
+    app.add_middleware(RequestLoggingMiddleware)
+
+    # 路由
     app.include_router(sbom_router)
 
     # =========================
-    # 生命周期事件（官方推荐）
+    # 健康检查（k8s/systemd）
     # =========================
 
-    @app.on_event("startup")
-    async def on_startup() -> None:
-        logger.info("SBOM Service 启动完成")
+    @app.get("/healthz", include_in_schema=False)
+    async def healthz() -> PlainTextResponse:
+        return PlainTextResponse("ok")
 
-    @app.on_event("shutdown")
-    async def on_shutdown() -> None:
-        logger.info("SBOM Service 已关闭")
+    @app.get("/readyz", include_in_schema=False)
+    async def readyz() -> PlainTextResponse:
+        # 可以扩展为：检查 DB/DX/磁盘空间等
+        return PlainTextResponse("ready")
 
     # =========================
-    # 统一异常处理
+    # 异常处理
     # =========================
 
     @app.exception_handler(BusinessException)
-    async def handle_business_exception(
-        request: Request,
-        exc: BusinessException,
-    ) -> JSONResponse:
-        logger.warning(
-            "业务异常",
-            extra={
-                "path": request.url.path,
-                "method": request.method,
-                "error_code": exc.code,
-                "message": exc.message,
-                "data": exc.data,
-            },
+    async def handle_business_exception(request: Request, exc: BusinessException) -> JSONResponse:
+        rid = getattr(request.state, "request_id", "-")
+        log.warning(
+            "business_error request_id=%s code=%s msg=%s path=%s",
+            rid, exc.code, exc.message, request.url.path,
         )
 
-        payload: dict[str, Any] = {
-            "error_code": exc.code,
-            "message": exc.message,
-        }
+        payload = {"error_code": exc.code, "message": exc.message}
         if exc.data is not None:
             payload["data"] = exc.data
-
         return JSONResponse(status_code=200, content=payload)
 
     @app.exception_handler(Exception)
-    async def handle_unexpected_exception(
-        request: Request,
-        exc: Exception,
-    ) -> JSONResponse:
-        logger.exception(
-            "未捕获异常",
-            extra={
-                "path": request.url.path,
-                "method": request.method,
-                "error_type": type(exc).__name__,
-            },
+    async def handle_unexpected_exception(request: Request, exc: Exception) -> JSONResponse:
+        rid = getattr(request.state, "request_id", "-")
+        log.exception(
+            "unhandled_error request_id=%s type=%s path=%s",
+            rid, type(exc).__name__, request.url.path,
         )
-
         return JSONResponse(
             status_code=500,
-            content={
-                "error_code": "INTERNAL_SERVER_ERROR",
-                "message": "服务内部错误，请联系管理员",
-            },
+            content={"error_code": "INTERNAL_SERVER_ERROR", "message": "服务内部错误"},
         )
 
     return app
 
 
+# uvicorn 入口：兼容 `uvicorn main:app`
+app = create_app()
+
+
 # =========================
-# ASGI 入口
+# 允许 `python main.py` 直接启动（生产仍推荐 uvicorn CLI）
 # =========================
 
-app = create_app()
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "5544"))
+    workers = int(os.getenv("WORKERS", "1"))
+
+    # ✅ 生产推荐：通过 CLI 启动并交给进程管理器（systemd/docker/k8s）
+    # uvicorn main:app --host 0.0.0.0 --port 5544 --workers 2 --proxy-headers --forwarded-allow-ips="*"
+    uvicorn.run(
+        "main:app",
+        host=host,
+        port=port,
+        workers=workers,
+        # 开发调试用
+        reload=(ENV == "dev"),
+        log_level=LOG_LEVEL.lower(),
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
