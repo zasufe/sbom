@@ -13,4 +13,5 @@ python-multipart
 jsonref
 aiofiles
 httpx
-greenlet==2.0.1
+uvicorn
+loguru
